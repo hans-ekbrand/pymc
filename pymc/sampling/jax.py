@@ -577,6 +577,8 @@ def sample_numpyro_nuts(
     chain_method: str = "parallel",
     postprocessing_backend: Optional[Literal["cpu", "gpu"]] = None,
     postprocessing_vectorize: Literal["vmap", "scan"] = "scan",
+    batches: Optional[int] = 1,
+    vars_to_drop: Optional[str] = None,
     idata_kwargs: Optional[dict] = None,
     nuts_kwargs: Optional[dict] = None,
     postprocessing_chunks=None,
@@ -626,6 +628,16 @@ def sample_numpyro_nuts(
         Specify how postprocessing should be computed. gpu or cpu
     postprocessing_vectorize: Literal["vmap", "scan"], default "scan"
         How to vectorize the postprocessing: vmap or sequential scan
+    batches : Optional[int], default 1
+        Specify the number of batches of samples to collect. This is useful when the
+        desired total number of samples, ie. the number of draws multiplied by the number 
+        of chains will not into ram of the device that collects those (which is the GPU, 
+        if jaxlib with GPU-support is used). This parameter governs where samples are
+        stored during sampling, while the postprocessing refered to above only concerns
+        management of draws after sampling has finished.
+    vars_to_drop : Optional[str], default None,
+        To save RAM you might want to drop some variables while sampling. Currently,
+        this only works when batches > 1.
     idata_kwargs : dict, optional
         Keyword arguments for :func:`arviz.from_dict`. It also accepts a boolean as
         value for the ``log_likelihood`` key to indicate that the pointwise log
@@ -716,63 +728,100 @@ def sample_numpyro_nuts(
         ),
     )
 
-    raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
+    if batches < 2:
+        batches = 1
 
-    tic3 = datetime.now()
-    logger.info(f"Sampling time = {tic3 - tic2}")
+    for i in range(batches):
+        pmap_numpyro.post_warmup_state = pmap_numpyro.last_state
+        pmap_numpyro.run(pmap_numpyro.post_warmup_state.rng_key,
+                         extra_fields=(
+                             "num_steps",
+                             "potential_energy",
+                             "energy",
+                             "adapt_state.step_size",
+                             "accept_prob",
+                             "diverging",
+                         ),
+            )
+        raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
 
-    logger.info("Transforming variables...")
-    jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=vars_to_sample)
-    result = _postprocess_samples(
-        jax_fn,
-        raw_mcmc_samples,
-        postprocessing_backend=postprocessing_backend,
-        postprocessing_vectorize=postprocessing_vectorize,
-    )
-    mcmc_samples = {v.name: r for v, r in zip(vars_to_sample, result)}
+        tic3 = datetime.now()
+        logger.info(f"Sampling time = {tic3 - tic2}")
 
-    tic4 = datetime.now()
-    logger.info(f"Transformation time = {tic4 - tic3}")
-
-    if idata_kwargs is None:
-        idata_kwargs = {}
-    else:
-        idata_kwargs = idata_kwargs.copy()
-
-    if idata_kwargs.pop("log_likelihood", False):
-        tic5 = datetime.now()
-        logger.info("Computing Log Likelihood...")
-        log_likelihood = _get_log_likelihood(
-            model,
+        logger.info("Transforming variables...")
+        jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=vars_to_sample)
+        result = _postprocess_samples(
+            jax_fn,
             raw_mcmc_samples,
-            backend=postprocessing_backend,
+            postprocessing_backend=postprocessing_backend,
             postprocessing_vectorize=postprocessing_vectorize,
         )
-        tic6 = datetime.now()
-        logger.info(
-            f"Log Likelihood time = {tic6 - tic5}",
+        mcmc_samples = {v.name: r for v, r in zip(vars_to_sample, result)}
+
+        tic4 = datetime.now()
+        logger.info(f"Transformation time = {tic4 - tic3}")
+
+        if idata_kwargs is None:
+            idata_kwargs = {}
+        else:
+            idata_kwargs = idata_kwargs.copy()
+
+            if idata_kwargs.pop("log_likelihood", False):
+                tic5 = datetime.now()
+                logger.info("Computing Log Likelihood...")
+                log_likelihood = _get_log_likelihood(
+                    model,
+                    raw_mcmc_samples,
+                    backend=postprocessing_backend,
+                    postprocessing_vectorize=postprocessing_vectorize,
+                )
+                tic6 = datetime.now()
+                logger.info(
+                    f"Log Likelihood time = {tic6 - tic5}",
+                )
+            else:
+                log_likelihood = None
+
+        attrs = {
+            "sampling_time": (tic3 - tic2).total_seconds(),
+        }
+
+        coords, dims = coords_and_dims_for_inferencedata(model)
+        # Update 'coords' and 'dims' extracted from the model with user 'idata_kwargs'
+        # and drop keys 'coords' and 'dims' from 'idata_kwargs' if present.
+        _update_coords_and_dims(coords=coords, dims=dims, idata_kwargs=idata_kwargs)
+        # Use 'partial' to set default arguments before passing 'idata_kwargs'
+        to_trace = partial(
+            az.from_dict,
+            log_likelihood=log_likelihood,
+            observed_data=find_observations(model),
+            constant_data=find_constants(model),
+            sample_stats=_sample_stats_to_xarray(pmap_numpyro),
+            coords=coords,
+            dims=dims,
+            attrs=make_attrs(attrs, library=numpyro),
         )
-    else:
-        log_likelihood = None
+        az_trace = to_trace(posterior=mcmc_samples, **idata_kwargs)
 
-    attrs = {
-        "sampling_time": (tic3 - tic2).total_seconds(),
-    }
+        if vars_to_drop is not None:
+            if isinstance(vars_to_drop, str):
+                vars_to_drop = (vars_to_drop,) # turn it into an iterable (tuple)
+            for var in vars_to_drop:
+                logger.info("Discarding variable: " + var)
+                del az_trace['posterior'][var]
+                
+            # try:
+            #     for var in vars_to_drop:
+            #         logger.info("Discarding variable: " + var)
+            #         del az_trace['posterior'][var]
+            # except TypeError: # TypeError: 'some' object is not iterable
+            #     logger.info("Discarding variable: " + vars_to_drop)
+            #     del az_trace['posterior'][vars_to_drop]
 
-    coords, dims = coords_and_dims_for_inferencedata(model)
-    # Update 'coords' and 'dims' extracted from the model with user 'idata_kwargs'
-    # and drop keys 'coords' and 'dims' from 'idata_kwargs' if present.
-    _update_coords_and_dims(coords=coords, dims=dims, idata_kwargs=idata_kwargs)
-    # Use 'partial' to set default arguments before passing 'idata_kwargs'
-    to_trace = partial(
-        az.from_dict,
-        log_likelihood=log_likelihood,
-        observed_data=find_observations(model),
-        constant_data=find_constants(model),
-        sample_stats=_sample_stats_to_xarray(pmap_numpyro),
-        coords=coords,
-        dims=dims,
-        attrs=make_attrs(attrs, library=numpyro),
-    )
-    az_trace = to_trace(posterior=mcmc_samples, **idata_kwargs)
+        az_trace.to_netcdf('data_' + str(i) + '.netcdf')
+
+    if batches > 1:
+        az_trace = az.concat(*[az.from_netcdf(f'data_' + str(i) + '.netcdf') for i in range(batches)], dim = "draw")
+        for i in range(batches):
+            os.remove('data_' + str(i) + '.netcdf')
     return az_trace
